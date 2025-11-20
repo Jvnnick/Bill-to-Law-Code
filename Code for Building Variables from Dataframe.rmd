@@ -1,0 +1,205 @@
+---
+title: "Code for Building Variables from Dataframe"
+output:
+  pdf_document:
+    latex_engine: xelatex
+date: "2025-11-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r call-in-data-and-libraries}
+load("~/cinc_df_julia.rda")
+library(dplyr)
+```
+
+Calculating PROP_WOM
+```{r calculating-PROP_WOM}
+gender_ratio <- cinc_df_final %>%
+  filter(committeemember_umwelt %in% c(1, 2)) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    total_members = n(),
+    female_members = sum(sex == 1, na.rm = TRUE),
+    .groups = "drop"  
+  ) %>%
+  mutate(
+    female_ratio = female_members / total_members
+  ) %>%
+  select(state, legislature, female_ratio)
+
+print(gender_ratio, n = nrow(gender_ratio))
+
+
+summary(cinc_df_final$state)
+summary(cinc_df_final$legislature)
+table(cinc_df_final$committeemember_umwelt, useNA = "ifany")
+```
+
+Calculating CHAIR_WOM_DUMMY
+```{r calculating-CHAIR_WOM_DUMMY}
+# Filter for female Umwelt committee chairs
+female_chairs <- cinc_df_final[cinc_df_final$committeechair_umwelt == 1 & cinc_df_final$sex == 1, ]
+
+# Show unique state and legislature combinations
+result <- unique(female_chairs[, c("state", "legislature")])
+print(result, n = nrow(result))
+```
+
+First calculation for MINISTER_WOM_DUMMY
+I ended up coding this variable by hand based on Wikipedia entries 
+```{r calculating-MINISTER_WOM_DUMMY}
+# Count unique state-legislature combinations where minister_umwelt == 1
+num_minister_umwelt <- cinc_df_final %>%
+  filter(minister_umwelt == 1) %>%
+  distinct(state, legislature) %>%
+  nrow()
+
+print(num_minister_umwelt)
+
+#sex of ministers (used Wikipedia to double-check/fill out missing WP)
+library(dplyr)
+
+# Show sex of ministers, sorted by state (alphabetical) and legislature (numerical)
+ministers_sex <- cinc_df_final %>%
+  filter(minister_umwelt == 1) %>%
+  select(state, legislature, sex) %>%
+  arrange(state, as.numeric(legislature))
+
+print(ministers_sex, n = nrow(ministers_sex))
+```
+
+Calculating AVG_BIRTHDAY and AVG_AGE_TOTAL
+I didn't end up using these variables in the analysis
+I used AVG_AGE_START instead (see next code chunk)
+```{r calculating-AVG_BIRTHDAY-and-AVG_AGE_TOTAL}
+# Ensure birthdaynew is a Date
+cinc_df_final <- cinc_df_final %>%
+  mutate(birthdaynew = as.Date(birthdaynew))
+
+# Set reference year
+reference_date <- as.Date("2025-01-01")
+
+# Calculate average birthday and average age
+avg_birthday_age <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1, !is.na(birthdaynew)) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    avg_birthday = as.Date(mean(as.numeric(birthdaynew)), origin = "1970-01-01"),
+    avg_age = mean(as.numeric(difftime(reference_date, birthdaynew, units = "days")) / 365.25),
+    .groups = "drop"
+  ) %>%
+  arrange(state, as.numeric(legislature))
+
+print(avg_birthday_age, n = nrow(avg_birthday_age))
+```
+
+Calculating AVG_AGE_START
+```{r calculating-AVG_AGE_START}
+# Ensure both columns are Date type
+cinc_df_final <- cinc_df_final %>%
+  mutate(
+    birthdaynew = as.Date(birthdaynew),
+    legislaturestart = as.Date(legislaturestart)
+  )
+
+# Calculate average age at start of legislature
+avg_age_leg_start <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1, !is.na(birthdaynew), !is.na(legislaturestart)) %>%
+  mutate(age_at_start = as.numeric(difftime(legislaturestart, birthdaynew, units = "days")) / 365.25) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    avg_age_at_start = mean(age_at_start, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(state, as.numeric(legislature))
+
+print(avg_age_leg_start, n = nrow(avg_age_leg_start))
+```
+
+Calculating COMM_CHAIR_[PARTY], i.e., party membership of the committee chair 
+```{r calculating-COMM_CHAIR_PARTY}
+# Identify the party of the Umwelt committee chair for each state/legislature
+chair_party <- cinc_df_final %>%
+  filter(committeechair_umwelt == 1) %>%
+  select(state, legislature, newparty_1) %>%
+  arrange(state, as.numeric(legislature))
+
+print(chair_party, n = nrow(chair_party))
+```
+
+Calculating AVG_EDU
+```{r calculating-AVG_EDU}
+# Calculate average education level for Umwelt committee members by state/legislature
+avg_education <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1, !is.na(education)) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    avg_education = mean(education, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(state, as.numeric(legislature))
+
+print(avg_education, n = nrow(avg_education))
+```
+
+Calculating AVG_OCCEXP_BROAD_UMWELT and AVG_OCCEXP_NARROW_UMWELT
+I only ended up using ACG_OCCEXP_BROAD_UMWELT in the analysis
+```{r calculating-AVG_OCCEXP}
+# Average for occexpbroad_umwelt
+avg_occexpbroad <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1, !is.na(occexpbroad_umwelt)) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    avg_occexpbroad = mean(occexpbroad_umwelt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(state, as.numeric(legislature))
+
+print(avg_occexpbroad, n = nrow(avg_occexpbroad))
+
+# Average for occexpnarrow_umwelt
+avg_occexpnarrow <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1, !is.na(occexpnarrow_umwelt)) %>%
+  group_by(state, legislature) %>%
+  summarize(
+    avg_occexpnarrow = mean(occexpnarrow_umwelt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(state, as.numeric(legislature))
+
+print(avg_occexpnarrow, n = nrow(avg_occexpnarrow))
+```
+
+Calculating PROP_WOM_IN_PARL
+```{r calculating-PROP_WOM_IN_PARL}
+# Calculate proportion of women per state and legislature
+proportion_women <- cinc_df_final %>%
+  group_by(state, legislature) %>%
+  summarise(
+    total_individuals = n(),
+    women_count = sum(sex == 1),
+    proportion_women = women_count / total_individuals
+  ) %>%
+  arrange(state, legislature)
+
+# View the results
+print(proportion_women, n = nrow(proportion_women))
+```
+
+Calculating PROP_[PARTY]
+I didn't end up using this variable due to high correlations with other vairables
+```{r calculating-PROP_PARTY}
+party_fractions <- cinc_df_final %>%
+  filter(committeemember_umwelt == 1) %>%
+  group_by(state, legislature, newparty_1) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  group_by(state, legislature) %>%
+  mutate(fraction = n / sum(n)) %>%
+  ungroup() %>%
+  arrange(state, as.numeric(legislature), newparty_1)
+
+print(party_fractions, n = nrow(party_fractions))
+```

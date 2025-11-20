@@ -1,0 +1,827 @@
+---
+title: "Code for Master's Thesis Analysis Julia Ebben"
+output:
+  pdf_document:
+    latex_engine: xelatex
+date: "2025-11-20"
+---
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# set CRAN mirror for any installs that run in this session
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+# avoid setwd() during knit; use project/UNC root here instead
+knitr::opts_knit$set(root.dir = "//ad.uni-hamburg.de/redir/redir0110/BBC9950/Documents")
+```
+
+```{r load-libraries}
+library(readxl)
+library(dplyr)
+library(stargazer)  
+library(car)
+library(fixest)
+library(modelsummary)
+library(clubSandwich)
+library(plm)
+library(e1071)
+```
+
+Call in Data
+```{r call-in-data}
+df1 <- read_excel("cosine_summary.xlsx") %>% 
+  filter(OVERUNIT_ID != "NI12")
+
+df2 <- read_excel("DATAFRAME.xlsx")
+
+df3 <- read_excel("pair_deltas.xlsx")
+
+merged_df12 <- merge(df1, df2, by = "OVERUNIT_ID", all = TRUE)
+
+merged_df <- merge(
+  merged_df12, df3, 
+  by = "pair_relative_path", 
+  all = TRUE
+)
+
+merged_df <- merged_df %>% filter(OVERUNIT_ID != "NI12")
+if (interactive()) View(merged_df)
+
+#write.xlsx(merged_df, "merged_all_three.xlsx")
+```
+
+Table export helper
+```{r export-paths, include=FALSE}
+# Always write tables to: C:/Users/BBC9950/Documents/tables
+out_dir <- file.path(Sys.getenv("USERPROFILE"), "Documents", "tables")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Minimal, version-robust LaTeX export for fixest models 
+export_fixest_tex <- function(..., file) {
+  args <- list(..., se.below = TRUE,
+               fitstat = c("n","r2","wr2","war2","rmse"),
+               signif.code = c("+"=0.10,"*"=0.05,"**"=0.01,"***"=0.001))
+  tex_str <- tryCatch(
+    do.call(fixest::etable, c(args, list(tex = TRUE))),
+    error = function(e) paste(capture.output(do.call(fixest::etable,
+                                                     c(args, list(style = "latex")))), collapse = "\n")
+  )
+  writeLines(tex_str, file)
+  msg <- normalizePath(file, winslash = "\\", mustWork = FALSE)
+  message("Saved LaTeX table to: ", msg)
+  invisible(msg)
+}
+```
+
+Looking at the mean and variance of cosine_similarity
+mean = 0.9159404
+variance = 0.01602832
+```{r looking-at-dep-var-first-analysis}
+mean(merged_df$cosine_similarity, na.rm=TRUE)      
+var(merged_df$cosine_similarity, na.rm=TRUE)       
+sd(merged_df$cosine_similarity, na.rm=TRUE)        
+```
+
+Looking at the mean and variance of PROP_WOM
+mean = 0.3178416
+variance = 0.02937136
+```{r looking-at-main-ind-var}
+mean(merged_df$PROP_WOM, na.rm=TRUE)      
+var(merged_df$PROP_WOM, na.rm=TRUE)       
+sd(merged_df$PROP_WOM, na.rm=TRUE)        
+```
+
+Looking at the mean and variance of delta_total_dict_matches
+mean = 0.1276316
+variance = 1.06801
+Really small mean -> very few entries have any change in total dictionary matches
+```{r looking-at-main-dep-var-second-analysis}
+mean(merged_df$delta_total_dict_matches, na.rm=TRUE)      
+var(merged_df$delta_total_dict_matches, na.rm=TRUE)       
+sd(merged_df$delta_total_dict_matches, na.rm=TRUE)        
+```
+
+This test looks at the skewness of delta_total_dict_matches and the zero counts
+83.8%, or 637 of the 760 observations are zero 
+```{r delta_dict skewness and zero counts}
+x <- merged_df$delta_total_dict_matches
+n_rows    <- nrow(merged_df)
+n_nonmiss <- sum(!is.na(x))
+n_zero    <- sum(x == 0, na.rm = TRUE)
+skew_val  <- e1071::skewness(x, na.rm = TRUE, type = 2)  # bias-corrected
+
+cat(sprintf(
+  "Total rows: %d\nNon-missing: %d\nZeros: %d (%.1f%% of non-missing, %.1f%% of all rows)\nSkewness (type 2): %.3f\n",
+  n_rows, n_nonmiss, n_zero, 100 * n_zero / n_nonmiss, 100 * n_zero / n_rows, skew_val
+))
+
+# Summary and quantiles
+print(summary(x))
+print(round(quantile(x, probs = c(.01,.05,.10,.25,.5,.75,.90,.95,.99), na.rm = TRUE), 3))
+
+# Plots: raw and log1p to visualize right tail with many zeros
+op <- par(mfrow = c(1, 2))
+hist(x, breaks = 30, main = "delta_total_dict_matches", xlab = "value", col = "gray80", border = "white")
+hist(log1p(pmax(x, 0)), breaks = 30, main = "log1p(value)", xlab = "log1p(value)", col = "gray80", border = "white")
+par(op)
+```
+
+Creating a visual for the distribution of delta_total_dict_matches
+``` {r distribution-delta-total-dict-matches-histogram}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  if (!requireNamespace("e1071", quietly = TRUE)) install.packages("e1071")
+})
+
+# Data and summary
+df_delta <- na.omit(data.frame(x = merged_df$delta_total_dict_matches))
+n_rows    <- nrow(merged_df)
+n_nonmiss <- nrow(df_delta)
+n_zero    <- sum(df_delta$x == 0)
+skew_val  <- e1071::skewness(df_delta$x, na.rm = TRUE, type = 2)
+
+cat(sprintf(
+  "Total rows: %d\nNon-missing: %d\nZeros: %d (%.1f%% of non-missing, %.1f%% of all rows)\nSkewness (type 2): %.3f\n",
+  n_rows, n_nonmiss, n_zero, 100 * n_zero / n_nonmiss, 100 * n_zero / n_rows, skew_val
+))
+
+# Nice-looking histogram with density overlay
+# Binwidth via Freedman–Diaconis (fallback to 0.5 if IQR is 0)
+bw_fd <- tryCatch(2 * IQR(df_delta$x) / (n_nonmiss)^(1/3), error = function(e) NA_real_)
+if (!is.finite(bw_fd) || bw_fd <= 0) bw_fd <- 0.5
+
+x_max <- max(df_delta$x, na.rm = TRUE)
+x_max_break <- ceiling(x_max / 5) * 5  # round up to nearest 5 for clean ticks
+
+p_counts <- ggplot(df_delta, aes(x)) +
+  geom_histogram(aes(y = after_stat(count)),
+                 binwidth = bw_fd, boundary = 0, closed = "right",
+                 fill = "#4C78A8", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = 2, color = "gray40") +
+  scale_x_continuous(name = "delta_total_dict_matches",
+                     breaks = seq(-10, x_max_break, by = 5),
+                     limits = c(-10, x_max_break)) +
+  ylab("Count") + theme_minimal()
+print(p_counts)
+
+# Save for paper (PNG + PDF)
+fig_dir <- file.path(getwd(), "figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+ggsave(file.path(fig_dir, "delta_total_dict_matches_hist.png"), p_counts, width = 7, height = 5, dpi = 320, units = "in")
+ggsave(file.path(fig_dir, "delta_total_dict_matches_hist.pdf"), p_counts, width = 7, height = 5, units = "in")
+
+cat("Saved to:\n", normalizePath(fig_dir, winslash = "\\"), "\n")
+```
+
+Checking proportions of LR_DUMMY and AMENDMENT_DUMMY
+17% of bill-law pairs are not introduced by the LR
+52% of bill-law pairs are amendments(/updates to existing laws)
+```{r lr-and-amendment-zero-shares}
+suppressPackageStartupMessages(library(dplyr))
+
+props_01 <- function(df, vars) {
+  dplyr::bind_rows(lapply(vars, function(v) {
+    x <- suppressWarnings(as.numeric(as.character(df[[v]]))) 
+    n_nonmiss <- sum(!is.na(x))
+    ones  <- sum(x == 1, na.rm = TRUE)
+    zeros <- sum(x == 0, na.rm = TRUE)
+    tibble::tibble(
+      variable  = v,
+      n_nonmiss = n_nonmiss,
+      missing   = sum(is.na(x)),
+      zeros     = zeros,
+      ones      = ones,
+      prop0     = ifelse(n_nonmiss > 0, zeros / n_nonmiss, NA_real_),
+      prop1     = ifelse(n_nonmiss > 0, ones  / n_nonmiss, NA_real_)
+    )
+  }))
+}
+
+res <- props_01(merged_df, c("AMENDMENT_DUMMY","LR_DUMMY")) %>%
+  mutate(across(c(prop0, prop1), ~ round(.x, 3)))
+
+print(res, n = Inf, width = Inf)
+```
+
+This fixed effects diagnostics test affirms that there is still variation when state fixed effects are added
+```{r state-fixed-effects-diagnostics}
+merged_df <- merged_df %>%
+  mutate(state_code = substr(as.character(OVERUNIT_ID), 1, 2))
+
+# quick checks
+cat("States found (counts):\n"); print(sort(table(merged_df$state_code)))
+cat("Number of distinct states:", dplyr::n_distinct(merged_df$state_code), "\n")
+
+# define predictors to test 
+predictors <- c(
+  "PROP_WOM", "LR_DUMMY", "AMENDMENT_DUMMY", "CHAIR_WOM_DUMMY", "MINISTER_WOM_DUMMY",
+  "MINISTER_GRÜNE_DUMMY", "COMM_CHAIR_GRÜNE_DUMMY", "AVG_AGE_START", "AVG_EDU", "AVG_OCCEXP_BROAD_UMWELT",
+  "ALIGN_CHAIR_MINISTER", "PROP_WOM_IN_PARL"
+)
+predictors <- predictors[predictors %in% names(merged_df)]
+
+# compute whether each predictor has any within-state variation
+no_within_state <- sapply(predictors, function(v) {
+  x <- merged_df[[v]]
+  if (all(is.na(x))) return(TRUE)
+  dd <- merged_df %>% group_by(state_code) %>% summarize(n = n_distinct(.data[[v]], na.rm = TRUE)) %>% pull(n)
+  all(dd <= 1, na.rm = TRUE)
+})
+
+diag_state_tbl <- data.frame(
+  variable = predictors,
+  no_within_state_variation = as.logical(no_within_state),
+  stringsAsFactors = FALSE
+) %>% arrange(no_within_state_variation)
+
+print(diag_state_tbl)
+
+cat("\nVariables WITH within-state variation (can be identified by state FE):\n")
+print(diag_state_tbl$variable[!diag_state_tbl$no_within_state_variation])
+
+cat("\nVariables WITHOUT within-state variation (will be absorbed by state FE):\n")
+print(diag_state_tbl$variable[diag_state_tbl$no_within_state_variation])
+```
+
+Amount of variance in predictors explained by state fixed effects
+The largest between_share variance for any variable is 0.586 (PROP_WOM_IN_PARL) 
+PROP_WOM's between_variance is 0.416
+CHAIR_WOM_DUMMY's between_variance is 0.256
+```{r state-fe-variance-loss}
+suppressPackageStartupMessages(library(dplyr))
+
+if (!"state_code" %in% names(merged_df) && "OVERUNIT_ID" %in% names(merged_df)) {
+  merged_df <- merged_df %>% dplyr::mutate(state_code = substr(as.character(OVERUNIT_ID), 1, 2))
+}
+
+preds <- c(
+  "PROP_WOM","LR_DUMMY","AMENDMENT_DUMMY","CHAIR_WOM_DUMMY","MINISTER_WOM_DUMMY",
+  "MINISTER_GRÜNE_DUMMY","COMM_CHAIR_GRÜNE_DUMMY","AVG_AGE_START","AVG_EDU",
+  "AVG_OCCEXP_BROAD_UMWELT","ALIGN_CHAIR_MINISTER","PROP_WOM_IN_PARL","delta_total_dict_matches","cosine_similarity"
+)
+preds <- intersect(preds, names(merged_df))
+
+decomp_one <- function(df, var) {
+  df2 <- df %>%
+    dplyr::select(state_code, dplyr::all_of(var)) %>%
+    dplyr::filter(!is.na(state_code), !is.na(.data[[var]]))
+  x <- df2[[var]]
+  if (length(x) < 2) {
+    return(tibble::tibble(
+      variable = var, N = length(x),
+      total_var = NA_real_, between_var = NA_real_, within_var = NA_real_,
+      between_share = NA_real_, within_share = NA_real_, R2_stateFE = NA_real_
+    ))
+  }
+  N <- nrow(df2)
+  overall <- mean(x)
+  grp <- df2 %>%
+    dplyr::group_by(state_code) %>%
+    dplyr::summarize(n = dplyr::n(), mean = mean(.data[[var]]), .groups = "drop")
+  between_var <- sum(grp$n * (grp$mean - overall)^2) / (N - 1)
+  total_var   <- stats::var(x)
+  within_var  <- total_var - between_var
+  R2 <- tryCatch(summary(lm(x ~ factor(df2$state_code)))$r.squared, error = function(e) NA_real_)
+  tibble::tibble(
+    variable = var, N = N,
+    total_var = total_var,
+    between_var = between_var,
+    within_var = within_var,
+    between_share = between_var / total_var,
+    within_share = within_var / total_var,
+    R2_stateFE = R2
+  )
+}
+
+res <- dplyr::bind_rows(lapply(preds, function(v) decomp_one(merged_df, v))) %>%
+  dplyr::arrange(dplyr::desc(between_share))
+
+print(res, n = Inf, width = Inf)
+
+cat("\nInterpretation:\n",
+    "- between_share ≈ fraction of X’s variance removed by adding state FE.\n",
+    "- within_share ≈ fraction left for identification with state FE.\n",
+    "- R2_stateFE should match between_share (X ~ state dummies).\n", sep = "")
+
+# Optional: save
+# out_dir <- file.path(getwd(), "tables"); dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+# utils::write.csv(tw_decomp, file.path(out_dir, "two_way_fe_variance.csv"), row.names = FALSE)
+```
+
+# --- REGRESSIONS ---
+
+Models for cosine_similarity and delta_total_dict_matches with just Pooled OLS and with Pooled OLS with State FE
+```{r building-models-and-tables}
+rhs_steps <- list(
+  c("PROP_WOM"),
+  c("CHAIR_WOM_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY","ALIGN_CHAIR_MINISTER"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY","ALIGN_CHAIR_MINISTER","PROP_WOM_IN_PARL")
+)
+
+build_formula <- function(dv, k, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  rhs <- paste(rhs_steps[[k]], collapse = " + ")
+  if (fe_mode == "none") {
+    as.formula(paste0(dv, " ~ ", rhs))
+  } else {
+    as.formula(paste0(dv, " ~ ", rhs, " | state_code"))
+  }
+}
+
+run_series <- function(dv, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  mods <- vector("list", length(rhs_steps))
+  for (k in seq_along(rhs_steps)) {
+    fml <- build_formula(dv, k, fe_mode)
+    mods[[k]] <- feols(fml, data = merged_df)
+  }
+  names(mods) <- paste0(seq_along(rhs_steps))
+  mods
+}
+
+# Build series 
+mods_cos_none  <- run_series("cosine_similarity", fe_mode = "none")
+mods_cos_state <- run_series("cosine_similarity", fe_mode = "state")
+mods_del_none  <- run_series("delta_total_dict_matches", fe_mode = "none")
+mods_del_state <- run_series("delta_total_dict_matches", fe_mode = "state")
+
+# Metrics
+mae_vec  <- function(models) sapply(models, function(m) mean(abs(residuals(m)), na.rm = TRUE))
+rmse_vec <- function(models) sapply(models, function(m) sqrt(mean(residuals(m)^2, na.rm = TRUE)))
+
+
+strip_se_type <- function(x) {
+  lines <- strsplit(x, "\n", fixed = TRUE)[[1]]
+  lines <- lines[!grepl("^S\\.E\\. type", lines)]
+  paste(lines, collapse = "\n")
+}
+
+# Console preview; prints MAE/RMSE below
+print_etable_clean <- function(models) {
+  tbl_str <- capture.output(etable(models, se.below = TRUE, fitstat = c("n","r2","rmse")))
+  cat(strip_se_type(paste(tbl_str, collapse = "\n")), "\n")
+  cat("\nMAE:\n"); print(round(mae_vec(models), 4))
+}
+
+# Export using modelsummary (works for both LaTeX/HTML); adds RMSE and MAE rows
+export_etable <- function(models, file_tex, file_html = NULL) {
+  if (!requireNamespace("modelsummary", quietly = TRUE)) install.packages("modelsummary")
+  library(modelsummary)
+
+  ms_list <- models; names(ms_list) <- names(models)
+
+  # Add RMSE and MAE rows
+  mae_vals  <- round(mae_vec(models), 4)
+  add_rows_df <- rbind(
+    data.frame(term = "MAE",  t(mae_vals),  check.names = FALSE)
+  )
+  colnames(add_rows_df)[-1] <- names(models)
+
+  # LaTeX
+  modelsummary(
+    ms_list,
+    output   = file_tex,
+    stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+    gof_omit = "IC|Log|Adj|AIC|BIC",
+    add_rows = add_rows_df
+  )
+
+  # HTML 
+  if (!is.null(file_html)) {
+    modelsummary(
+      ms_list,
+      output   = file_html,
+      stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+      gof_omit = "IC|Log|Adj|AIC|BIC",
+      add_rows = add_rows_df
+    )
+  }
+  message("Wrote: ",
+          normalizePath(file_tex, winslash = "\\"),
+          if (!is.null(file_html)) paste0(" and ", normalizePath(file_html, winslash = "\\")) else "")
+}
+
+# Output dir
+out_dir <- file.path(getwd(), "tables"); dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Write LaTeX + HTML
+export_etable(mods_cos_none,
+              file_tex  = file.path(out_dir, "S1_cosine_noFE_8cols.tex"),
+              file_html = file.path(out_dir, "S1_cosine_noFE_8cols.html"))
+export_etable(mods_cos_state,
+              file_tex  = file.path(out_dir, "S2_cosine_stateFE_8cols.tex"),
+              file_html = file.path(out_dir, "S2_cosine_stateFE_8cols.html"))
+export_etable(mods_del_none,
+              file_tex  = file.path(out_dir, "S3_delta_noFE_8cols.tex"),
+              file_html = file.path(out_dir, "S3_delta_noFE_8cols.html"))
+export_etable(mods_del_state,
+              file_tex  = file.path(out_dir, "S4_delta_stateFE_8cols.tex"),
+              file_html = file.path(out_dir, "S4_delta_stateFE_8cols.html"))
+
+# Console previews
+cat("\nCosine (no FE)\n");        print_etable_clean(mods_cos_none)
+cat("\nCosine (state FE)\n");    print_etable_clean(mods_cos_state)
+cat("\nDelta (no FE)\n");        print_etable_clean(mods_del_none)
+cat("\nDelta (state FE)\n");     print_etable_clean(mods_del_state)
+```
+
+Marginal effects plot for the interaction model between PROP_WOM and CHAIR_WOM_DUMMY with dict delta
+```{r marginal-effects-plot-delta-interaction}
+suppressPackageStartupMessages(library(ggplot2))
+
+# 1) Estimate interaction model
+mod_int <- lm(delta_total_dict_matches ~ PROP_WOM * CHAIR_WOM_DUMMY, data = merged_df)
+
+# 2) Prediction grid for lines (chair = 0 / 1)
+rng <- range(merged_df$PROP_WOM, na.rm = TRUE)
+grid_pred <- expand.grid(
+  PROP_WOM = seq(rng[1], rng[2], length.out = 100),
+  CHAIR_WOM_DUMMY = c(0, 1)
+)
+
+pred_obj <- predict(mod_int, newdata = grid_pred, se.fit = TRUE)
+grid_pred$fit <- pred_obj$fit
+grid_pred$se  <- pred_obj$se.fit
+grid_pred$lo  <- grid_pred$fit - 1.96 * grid_pred$se
+grid_pred$hi  <- grid_pred$fit + 1.96 * grid_pred$se
+grid_pred$chair_fac <- factor(grid_pred$CHAIR_WOM_DUMMY, labels = c("Chair=0","Chair=1"))
+
+p1 <- ggplot(grid_pred, aes(PROP_WOM, fit, color = chair_fac, fill = chair_fac)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +  # use linewidth (not size) for ggplot >= 3.4
+  labs(title = "Predicted delta_total_dict_matches",
+       x = "PROP_WOM",
+       y = "Predicted value",
+       color = "", fill = "") +
+  theme_minimal()
+
+print(p1)
+
+# 3) Marginal effect of CHAIR_WOM_DUMMY across PROP_WOM
+b <- coef(mod_int)
+V <- vcov(mod_int)
+b_chair <- b["CHAIR_WOM_DUMMY"]
+b_int   <- b["PROP_WOM:CHAIR_WOM_DUMMY"]
+
+grid_me <- data.frame(PROP_WOM = seq(rng[1], rng[2], length.out = 100))
+grid_me$AME_chair <- b_chair + b_int * grid_me$PROP_WOM
+# Var(b_chair + x*b_int) = Var(b_chair) + x^2 Var(b_int) + 2x Cov(b_chair,b_int)
+v_chair <- V["CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY"]
+v_int   <- V["PROP_WOM:CHAIR_WOM_DUMMY","PROP_WOM:CHAIR_WOM_DUMMY"]
+cov_ci  <- V["CHAIR_WOM_DUMMY","PROP_WOM:CHAIR_WOM_DUMMY"]
+grid_me$SE_AME <- sqrt(v_chair + (grid_me$PROP_WOM^2)*v_int + 2*grid_me$PROP_WOM*cov_ci)
+grid_me$LO <- grid_me$AME_chair - 1.96 * grid_me$SE_AME
+grid_me$HI <- grid_me$AME_chair + 1.96 * grid_me$SE_AME
+
+p2 <- ggplot(grid_me, aes(PROP_WOM, AME_chair)) +
+  geom_ribbon(aes(ymin = LO, ymax = HI), alpha = 0.15, fill = "#2C7BB6") +
+  geom_line(color = "#2C7BB6", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = 2, color = "gray40") +
+  labs(title = "Marginal effect of CHAIR_WOM_DUMMY (1 vs 0)",
+       x = "PROP_WOM",
+       y = "Effect on delta_total_dict_matches") +
+  theme_minimal()
+
+print(p2)
+
+# 4) Slopes of PROP_WOM by chair status (constant across PROP_WOM)
+slope_chair0 <- b["PROP_WOM"]
+slope_chair1 <- b["PROP_WOM"] + b_int
+cat("\nSlope of PROP_WOM when CHAIR_WOM_DUMMY=0:", round(slope_chair0, 4), "\n")
+cat("Slope of PROP_WOM when CHAIR_WOM_DUMMY=1:", round(slope_chair1, 4), "\n")
+
+# 5) Save figures (PNG + PDF)
+fig_dir <- file.path(getwd(), "figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(filename = file.path(fig_dir, "predicted_delta_lines.png"),
+       plot = p1, width = 7, height = 5, dpi = 300, units = "in")
+ggsave(filename = file.path(fig_dir, "predicted_delta_lines.pdf"),
+       plot = p1, width = 7, height = 5, units = "in")
+
+ggsave(filename = file.path(fig_dir, "marginal_effect_chair.png"),
+       plot = p2, width = 7, height = 5, dpi = 300, units = "in")
+ggsave(filename = file.path(fig_dir, "marginal_effect_chair.pdf"),
+       plot = p2, width = 7, height = 5, units = "in")
+
+cat("Saved figures to:\n", normalizePath(fig_dir, winslash = "\\"), "\n")
+```
+
+This model breaks down the demographic variables one-by-one (to be presented in the appendix)
+Looking at the table it produces with cosine_similarity as the dependent variable (no state fixed effects), one can see that AVG_AGE_START is the variable that pulls the significance away from PROP_WOM
+```{r model-with-demographic-variable-breakdown}
+rhs_steps <- list(
+  c("PROP_WOM"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_EDU"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_OCCEXP_BROAD_UMWELT"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","EAST_DUMMY")
+)
+
+build_formula <- function(dv, k, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  rhs <- paste(rhs_steps[[k]], collapse = " + ")
+  if (fe_mode == "none") {
+    as.formula(paste0(dv, " ~ ", rhs))
+  } else {
+    as.formula(paste0(dv, " ~ ", rhs, " | state_code"))
+  }
+}
+
+run_series <- function(dv, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  mods <- vector("list", length(rhs_steps))
+  for (k in seq_along(rhs_steps)) {
+    fml <- build_formula(dv, k, fe_mode)
+    mods[[k]] <- feols(fml, data = merged_df) 
+  }
+  names(mods) <- paste0(seq_along(rhs_steps))
+  mods
+}
+
+# Build series 
+mods_cos_none  <- run_series("cosine_similarity", fe_mode = "none")
+mods_cos_state <- run_series("cosine_similarity", fe_mode = "state")
+mods_del_none  <- run_series("delta_total_dict_matches", fe_mode = "none")
+mods_del_state <- run_series("delta_total_dict_matches", fe_mode = "state")
+
+# Metrics
+mae_vec  <- function(models) sapply(models, function(m) mean(abs(residuals(m)), na.rm = TRUE))
+rmse_vec <- function(models) sapply(models, function(m) sqrt(mean(residuals(m)^2, na.rm = TRUE)))
+
+strip_se_type <- function(x) {
+  lines <- strsplit(x, "\n", fixed = TRUE)[[1]]
+  lines <- lines[!grepl("^S\\.E\\. type", lines)]
+  paste(lines, collapse = "\n")
+}
+
+# Console preview 
+print_etable_clean <- function(models) {
+  tbl_str <- capture.output(etable(models, se.below = TRUE, fitstat = c("n","r2","rmse")))
+  cat(strip_se_type(paste(tbl_str, collapse = "\n")), "\n")
+  cat("\nMAE:\n"); print(round(mae_vec(models), 4))
+}
+
+# Export using modelsummary (works for both LaTeX/HTML); adds RMSE and MAE rows
+export_etable <- function(models, file_tex, file_html = NULL) {
+  if (!requireNamespace("modelsummary", quietly = TRUE)) install.packages("modelsummary")
+  library(modelsummary)
+
+  ms_list <- models; names(ms_list) <- names(models)
+
+  # Add RMSE and MAE rows
+  mae_vals  <- round(mae_vec(models), 4)
+  add_rows_df <- rbind(
+    data.frame(term = "MAE",  t(mae_vals),  check.names = FALSE)
+  )
+  colnames(add_rows_df)[-1] <- names(models)
+
+  # LaTeX
+  modelsummary(
+    ms_list,
+    output   = file_tex,
+    stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+    gof_omit = "IC|Log|Adj|AIC|BIC",
+    add_rows = add_rows_df
+  )
+
+  # HTML 
+  if (!is.null(file_html)) {
+    modelsummary(
+      ms_list,
+      output   = file_html,
+      stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+      gof_omit = "IC|Log|Adj|AIC|BIC",
+      add_rows = add_rows_df
+    )
+  }
+  message("Wrote: ",
+          normalizePath(file_tex, winslash = "\\"),
+          if (!is.null(file_html)) paste0(" and ", normalizePath(file_html, winslash = "\\")) else "")
+}
+
+# Output dir
+out_dir <- file.path(getwd(), "tables"); dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Write LaTeX + HTML 
+export_etable(mods_cos_none,
+              file_tex  = file.path(out_dir, "S1_cosine_noFE_7cols_demo.tex"),
+              file_html = file.path(out_dir, "S1_cosine_noFE_7cols_demo.html"))
+export_etable(mods_cos_state,
+              file_tex  = file.path(out_dir, "S2_cosine_stateFE_7cols_demo.tex"),
+              file_html = file.path(out_dir, "S2_cosine_stateFE_7cols_demo.html"))
+export_etable(mods_del_none,
+              file_tex  = file.path(out_dir, "S3_delta_noFE_7cols_demo.tex"),
+              file_html = file.path(out_dir, "S3_delta_noFE_7cols_demo.html"))
+export_etable(mods_del_state,
+              file_tex  = file.path(out_dir, "S4_delta_stateFE_7cols_demo.tex"),
+              file_html = file.path(out_dir, "S4_delta_stateFE_7cols_demo.html"))
+
+# Console previews
+cat("\nCosine (no FE)\n");        print_etable_clean(mods_cos_none)
+cat("\nCosine (state FE)\n");    print_etable_clean(mods_cos_state)
+cat("\nDelta (no FE)\n");        print_etable_clean(mods_del_none)
+cat("\nDelta (state FE)\n");     print_etable_clean(mods_del_state)
+```
+
+Here's a variation with SPD and LINKE vars to try to better cover the party ideology effect found in the literature
+Adding these to parties is motivated by the finding in Fetscher that women in the Landtagen are significantly associated with GRÜNE, SPD, and LINKE (pg. 21)
+It's a robustness check for the appendix
+```{r building-models-and-tables-including-SPD-LINKE}
+rhs_steps <- list(
+  c("PROP_WOM"),
+  c("CHAIR_WOM_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY","ALIGN_CHAIR_MINISTER"),
+  c("PROP_WOM","CHAIR_WOM_DUMMY","CHAIR_WOM_DUMMY:PROP_WOM","COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY","LR_DUMMY","AMENDMENT_DUMMY","AVG_AGE_START","AVG_EDU","AVG_OCCEXP_BROAD_UMWELT","EAST_DUMMY","ALIGN_CHAIR_MINISTER","PROP_WOM_IN_PARL")
+)
+
+build_formula <- function(dv, k, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  rhs <- paste(rhs_steps[[k]], collapse = " + ")
+  if (fe_mode == "none") {
+    as.formula(paste0(dv, " ~ ", rhs))
+  } else {
+    as.formula(paste0(dv, " ~ ", rhs, " | state_code"))
+  }
+}
+
+run_series <- function(dv, fe_mode = c("none","state")) {
+  fe_mode <- match.arg(fe_mode)
+  mods <- vector("list", length(rhs_steps))
+  for (k in seq_along(rhs_steps)) {
+    fml <- build_formula(dv, k, fe_mode)
+    mods[[k]] <- feols(fml, data = merged_df)
+  }
+  names(mods) <- paste0(seq_along(rhs_steps))
+  mods
+}
+
+# Build series
+mods_cos_none  <- run_series("cosine_similarity", fe_mode = "none")
+mods_cos_state <- run_series("cosine_similarity", fe_mode = "state")
+mods_del_none  <- run_series("delta_total_dict_matches", fe_mode = "none")
+mods_del_state <- run_series("delta_total_dict_matches", fe_mode = "state")
+
+# Metrics
+mae_vec  <- function(models) sapply(models, function(m) mean(abs(residuals(m)), na.rm = TRUE))
+rmse_vec <- function(models) sapply(models, function(m) sqrt(mean(residuals(m)^2, na.rm = TRUE)))
+
+
+strip_se_type <- function(x) {
+  lines <- strsplit(x, "\n", fixed = TRUE)[[1]]
+  lines <- lines[!grepl("^S\\.E\\. type", lines)]
+  paste(lines, collapse = "\n")
+}
+
+# Console preview; prints MAE/RMSE below
+print_etable_clean <- function(models) {
+  tbl_str <- capture.output(etable(models, se.below = TRUE, fitstat = c("n","r2","rmse")))
+  cat(strip_se_type(paste(tbl_str, collapse = "\n")), "\n")
+  cat("\nMAE:\n"); print(round(mae_vec(models), 4))
+}
+
+# Export using modelsummary (works for both LaTeX/HTML); adds RMSE and MAE rows
+export_etable <- function(models, file_tex, file_html = NULL) {
+  if (!requireNamespace("modelsummary", quietly = TRUE)) install.packages("modelsummary")
+  library(modelsummary)
+
+  ms_list <- models; names(ms_list) <- names(models)
+
+  # Add RMSE and MAE rows
+  mae_vals  <- round(mae_vec(models), 4)
+  add_rows_df <- rbind(
+    data.frame(term = "MAE",  t(mae_vals),  check.names = FALSE)
+  )
+  colnames(add_rows_df)[-1] <- names(models)
+
+  # LaTeX
+  modelsummary(
+    ms_list,
+    output   = file_tex,
+    stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+    gof_omit = "IC|Log|Adj|AIC|BIC",
+    add_rows = add_rows_df
+  )
+
+  # HTML
+  if (!is.null(file_html)) {
+    modelsummary(
+      ms_list,
+      output   = file_html,
+      stars    = c("+"=.1,"*"=.05,"**"=.01,"***"=.001),
+      gof_omit = "IC|Log|Adj|AIC|BIC",
+      add_rows = add_rows_df
+    )
+  }
+  message("Wrote: ",
+          normalizePath(file_tex, winslash = "\\"),
+          if (!is.null(file_html)) paste0(" and ", normalizePath(file_html, winslash = "\\")) else "")
+}
+
+# Output dir
+out_dir <- file.path(getwd(), "tables"); dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Write LaTeX + HTML
+export_etable(mods_cos_none,
+              file_tex  = file.path(out_dir, "S1_cosine_noFE_Linke_spd_7cols.tex"),
+              file_html = file.path(out_dir, "S1_cosine_noFE_Linke_spd_7cols.html"))
+export_etable(mods_cos_state,
+              file_tex  = file.path(out_dir, "S2_cosine_stateFE_Linke_spd_7cols.tex"),
+              file_html = file.path(out_dir, "S2_cosine_stateFE_Linke_spd_7cols.html"))
+export_etable(mods_del_none,
+              file_tex  = file.path(out_dir, "S3_delta_noFE_Linke_spd_7cols.tex"),
+              file_html = file.path(out_dir, "S3_delta_noFE_Linke_spd_7cols.html"))
+export_etable(mods_del_state,
+              file_tex  = file.path(out_dir, "S4_delta_stateFE_Linke_spd_7cols.tex"),
+              file_html = file.path(out_dir, "S4_delta_stateFE_Linke_spd_7cols.html"))
+
+# Console previews
+cat("\nCosine (no FE)\n");        print_etable_clean(mods_cos_none)
+cat("\nCosine (state FE)\n");    print_etable_clean(mods_cos_state)
+cat("\nDelta (no FE)\n");        print_etable_clean(mods_del_none)
+cat("\nDelta (state FE)\n");     print_etable_clean(mods_del_state)
+```
+
+# --- Correlation and Variance Inflation Factor Tests ---
+Correlation matrix 
+```{r correlation-matrix}
+predictor_vars <- c(
+  "PROP_WOM","PROP_WOM_IN_PARL","LR_DUMMY","AMENDMENT_DUMMY","CHAIR_WOM_DUMMY","MINISTER_WOM_DUMMY",
+  "MINISTER_GRÜNE_DUMMY","MINISTER_CDUCSU_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY",
+  "MINISTER_OTHER_DUMMY","GRÜNE_in_REG","CDUCSU_in_REG","SPD_in_REG","FDP_in_REG","LINKE_in_REG",
+  "COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_CDUCSU_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY",
+  "COMM_CHAIR_OTHER_DUMMY","PROP_CDUCSU","PROP_FDP","PROP_GRÜNE","PROP_SPD","PROP_LINKE","PROP_OTHER",
+  "AVG_AGE_START","AVG_OCCEXP_BROAD_UMWELT","AVG_EDU","EAST_DUMMY"
+)
+cor_matrix <- cor(merged_df[, predictor_vars], use = "pairwise.complete.obs")
+print(round(cor_matrix, 2)) 
+```
+
+Here's a Variance Inflation Facotr (VIF) test for the specification with SPD and LINKE variables included
+The highest VIF is 2.69, so there doesn't seem to be a multicollinearity concern with this specification
+```{r vif-test-including-SPD-LINKE}
+preds <- c(
+  "PROP_WOM","LR_DUMMY","AMENDMENT_DUMMY","MINISTER_WOM_DUMMY","MINISTER_GRÜNE_DUMMY","MINISTER_SPD_DUMMY","MINISTER_LINKE_DUMMY",
+  "CHAIR_WOM_DUMMY","COMM_CHAIR_GRÜNE_DUMMY","COMM_CHAIR_SPD_DUMMY","COMM_CHAIR_LINKE_DUMMY","AVG_AGE_START","AVG_OCCEXP_BROAD_UMWELT",
+  "EAST_DUMMY","AVG_EDU","ALIGN_CHAIR_MINISTER","PROP_WOM_IN_PARL"
+)
+
+# pick an available numeric outcome (VIF depends on X, not y)
+y <- if ("cosine_similarity" %in% names(merged_df)) "cosine_similarity" else "delta_total_dict_matches"
+
+# build clean data and model
+use <- merged_df %>% select(all_of(c(y, preds))) %>% na.omit()
+form <- as.formula(paste(y, "~", paste(preds, collapse = " + ")))
+m <- lm(form, data = use)
+
+# compute VIFs (supports GVIF output if any multi-df terms exist)
+v <- car::vif(m)
+vif_tbl <-
+  if (is.matrix(v) && "GVIF" %in% colnames(v)) {
+    data.frame(term = rownames(v),
+               GVIF = v[,"GVIF"],
+               Df = v[,"Df"],
+               GVIF_adj = v[,"GVIF"]^(1/(2*v[,"Df"])),
+               row.names = NULL)
+  } else {
+    data.frame(term = names(v), VIF = as.numeric(v), row.names = NULL)
+  }
+
+# sort and flag
+vif_tbl <- vif_tbl %>%
+  mutate(flag5  = ifelse((VIF %||% GVIF_adj) > 5,  ">", ""),
+         flag10 = ifelse((VIF %||% GVIF_adj) > 10, ">>", "")) %>%
+  arrange(desc(VIF %||% GVIF_adj))
+
+print(vif_tbl, row.names = FALSE)
+cat("\nNotes:\n- Thresholds: >5 (moderate), >10 (high).\n- VIF shown is VIF (or GVIF^(1/(2*Df)) when applicable).\n")
+```
+
+# --- Variable Ranges for the Variable Definitions in Appendix ---
+Minimum and Maximum values of PROP_WOM and PROP_WOM_IN_PARL in the dataset
+PROP_WOM: 0-0.778
+PROP_WOM_IN_PARL: 0.0677-0.410
+```{r prop_wom-min-max}
+# Min/max for PROP_WOM and PROP_WOM_IN_PARL (overall)
+vars <- c("PROP_WOM","PROP_WOM_IN_PARL")
+missing <- setdiff(vars, names(merged_df))
+if (length(missing)) stop("Missing variables: ", paste(missing, collapse = ", "))
+
+overall_extrema <- sapply(merged_df[vars], function(x) {
+  c(min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE))
+})
+overall_extrema <- as.data.frame(t(overall_extrema))
+print(overall_extrema)
+```
+
+
+
